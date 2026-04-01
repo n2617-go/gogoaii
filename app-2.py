@@ -289,6 +289,87 @@ html, body, [data-testid="stAppViewContainer"] {
     font-size: 0.68rem; color: #64748b; text-align: center;
     margin-top: 0.3rem; letter-spacing: 0.02em;
 }
+
+/* 掃描全覽瀏覽器 */
+.scan-toolbar {
+    display: flex; gap: 0.4rem; align-items: center;
+    margin-bottom: 0.75rem; flex-wrap: wrap;
+}
+.scan-search-wrap {
+    flex: 1; min-width: 0;
+    background: rgba(255,255,255,0.05);
+    border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 8px;
+    padding: 0.35rem 0.6rem;
+    display: flex; align-items: center; gap: 0.4rem;
+}
+.scan-search-icon { font-size: 0.75rem; color: #475569; flex-shrink:0; }
+.sort-tabs {
+    display: flex; gap: 0.25rem; margin-bottom: 0.65rem;
+}
+.sort-tab {
+    font-size: 0.65rem; font-weight: 700;
+    border-radius: 8px; padding: 0.28rem 0.6rem;
+    background: rgba(255,255,255,0.05);
+    color: #64748b; cursor: pointer; border: 1px solid transparent;
+    white-space: nowrap;
+}
+.sort-tab.active {
+    background: rgba(56,189,248,0.15);
+    color: #38bdf8; border-color: rgba(56,189,248,0.3);
+}
+.scan-stats {
+    font-size: 0.65rem; color: #475569;
+    margin-bottom: 0.6rem; display: flex; justify-content: space-between;
+}
+.scan-row {
+    display: flex; align-items: center;
+    background: rgba(255,255,255,0.03);
+    border: 1px solid rgba(255,255,255,0.06);
+    border-radius: 10px; padding: 0.55rem 0.65rem;
+    margin-bottom: 0.35rem; gap: 0.5rem;
+    position: relative; overflow: hidden;
+}
+.scan-row::before {
+    content:''; position:absolute; top:0; left:0; bottom:0; width:2px;
+    background: var(--sr, #334155);
+}
+.scan-row-rank {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.68rem; color: #475569;
+    width: 1.8rem; text-align: right; flex-shrink: 0;
+}
+.scan-row-info { flex: 1; min-width: 0; }
+.scan-row-name {
+    font-size: 0.82rem; font-weight: 700; color: #f1f5f9;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.scan-row-code { font-family: 'JetBrains Mono', monospace; font-size: 0.62rem; color: #64748b; }
+.scan-row-right { text-align: right; flex-shrink: 0; }
+.scan-row-score {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.9rem; font-weight: 700; line-height: 1.1;
+}
+.scan-row-pct { font-family: 'JetBrains Mono', monospace; font-size: 0.65rem; }
+.scan-row-signals { display: flex; gap: 0.25rem; flex-wrap: wrap; margin-top: 0.3rem; }
+.scan-sig-chip {
+    font-size: 0.58rem; font-weight: 700;
+    background: rgba(34,197,94,0.1); color: #4ade80;
+    border: 1px solid rgba(34,197,94,0.2);
+    border-radius: 99px; padding: 0.1rem 0.4rem;
+}
+.scan-sig-chip.neutral {
+    background: rgba(148,163,184,0.08); color: #64748b;
+    border-color: rgba(148,163,184,0.15);
+}
+.page-nav {
+    display: flex; align-items: center; justify-content: center;
+    gap: 0.5rem; margin-top: 0.7rem;
+}
+.page-info {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.68rem; color: #64748b;
+}
 .rank-medal { font-size:0.9rem; margin-right:0.3rem; }
 .no-data { font-size: 0.75rem; color: #475569; text-align: center; padding: 0.5rem; font-style: italic; }
 .error-msg {
@@ -766,7 +847,7 @@ def run_market_scan_live(progress_bar, status_text, top_n: int = 200):
     progress_bar.progress(1.0)
     status_text.empty()
     results.sort(key=lambda x: x["score"], reverse=True)
-    return results[:5]
+    return results   # 回傳全部，由 UI 層決定顯示幾筆
 
 
 def analyze_signal(df):
@@ -940,7 +1021,7 @@ now = datetime.now().strftime("%Y/%m/%d %H:%M:%S")
 # ── 頂部標題 ─────────────────────────────────────────────
 st.markdown(
     '<div class="app-header">'
-    '<div class="app-title">📊 大師加持<span>開發中v4版</span></div>'
+    '<div class="app-title">📊 大師加持<span>開發中v5版</span></div>'
     f'<div class="app-time"><span class="live-dot"></span>即時更新<br>{now}</div>'
     '</div>',
     unsafe_allow_html=True,
@@ -994,41 +1075,65 @@ with st.expander("➕ 新增關注股票", expanded=False):
         )
 
 # ── 市場掃描推薦 ──────────────────────────────────────────
-MEDALS = ["🥇","🥈","🥉","4️⃣","5️⃣"]
+MEDALS   = ["🥇","🥈","🥉","4️⃣","5️⃣"]
+PAGE_SIZE = 20
 
-def render_rec_cards(top5):
-    SCORE_COLORS = ["#f59e0b","#94a3b8","#cd7f32","#38bdf8","#38bdf8"]
-    if not top5:
-        st.markdown('<div class="no-data">掃描完畢，目前無符合條件的股票</div>', unsafe_allow_html=True)
-        return
-    for i, s in enumerate(top5):
-        pct = (s["close"] - s["prev"]) / s["prev"] * 100 if s.get("prev") else 0
-        pct_color = "#ef4444" if pct > 0 else "#22c55e"
-        pct_str   = f"{'▲' if pct>0 else '▼'} {abs(pct):.2f}%"
-        sw        = min(s["score"], 100)
-        rc_color  = SCORE_COLORS[i] if i < len(SCORE_COLORS) else "#38bdf8"
-        reasons_html = "".join(
-            f'<span class="rec-reason">{r}</span>' for r in s.get("reasons", [])
-        )
-        inds_html = (
-            f'<span class="rec-ind">K {s["K"]:.0f}</span>'
-            f'<span class="rec-ind">D {s["D"]:.0f}</span>'
-            f'<span class="rec-ind">RSI {s["RSI"]:.0f}</span>'
-            f'<span class="rec-ind" style="color:{pct_color}">{pct_str}</span>'
-        )
+def _score_color(score):
+    if score >= 60: return "#22c55e"
+    if score >= 35: return "#f59e0b"
+    if score >= 10: return "#38bdf8"
+    return "#475569"
+
+def _score_bar_color(score):
+    if score >= 60: return "#22c55e"
+    if score >= 35: return "#f59e0b"
+    return "#38bdf8"
+
+def render_scan_row(rank, s, in_watchlist):
+    pct       = (s["close"] - s["prev"]) / s["prev"] * 100 if s.get("prev") else 0
+    pct_color = "#ef4444" if pct > 0 else "#22c55e"
+    pct_str   = f"{'▲' if pct>0 else '▼'} {abs(pct):.2f}%"
+    sc        = s["score"]
+    sc_color  = _score_color(sc)
+    bar_color = _score_bar_color(sc)
+    sr_color  = sc_color
+
+    reasons = s.get("reasons", [])
+    if reasons:
+        chips = "".join(f'<span class="scan-sig-chip">{r}</span>' for r in reasons)
+    else:
+        chips = '<span class="scan-sig-chip neutral">無明顯信號</span>'
+
+    medal = MEDALS[rank - 1] if rank <= 5 else f"#{rank}"
+
+    st.markdown(
+        f'<div class="scan-row" style="--sr:{sr_color};">'
+        f'<div class="scan-row-rank">{medal}</div>'
+        f'<div class="scan-row-info">'
+        f'<div class="scan-row-name">{s["name"]}</div>'
+        f'<div class="scan-row-code">{s["code"]} · '
+        f'K{s["K"]:.0f} D{s["D"]:.0f} RSI{s["RSI"]:.0f}</div>'
+        f'<div class="scan-row-signals">{chips}</div>'
+        f'</div>'
+        f'<div class="scan-row-right">'
+        f'<div class="scan-row-score" style="color:{sc_color};">{sc}分</div>'
+        f'<div class="score-bar-wrap" style="width:56px;margin:3px 0 3px auto;">'
+        f'<div class="score-bar-fill" style="--sw:{min(sc,100)}%;background:{bar_color};"></div></div>'
+        f'<div class="scan-row-pct" style="color:{pct_color};">{pct_str}</div>'
+        f'</div></div>',
+        unsafe_allow_html=True,
+    )
+    # 加入關注清單按鈕
+    btn_label = f"✓ 已加入" if in_watchlist else f"＋ 加入關注"
+    if not in_watchlist:
+        if st.button(btn_label, key=f"qadd_{s['code']}_{rank}", use_container_width=True):
+            st.session_state.watchlist.append({"id": s["code"], "name": s["name"]})
+            save_watchlist(st.session_state.watchlist)
+            st.rerun()
+    else:
         st.markdown(
-            f'<div class="rec-card" style="--rc:{rc_color};">'
-            f'<div class="rec-top"><div>'
-            f'<div class="rec-name"><span class="rank-medal">{MEDALS[i]}</span>{s["name"]}</div>'
-            f'<div class="rec-code">{s["code"]} · TW</div>'
-            f'</div><div class="rec-score-wrap">'
-            f'<div class="rec-score">{s["score"]}</div>'
-            f'<div class="score-bar-wrap"><div class="score-bar-fill" style="--sw:{sw}%;"></div></div>'
-            f'<div class="rec-score-label">技術評分</div>'
-            f'</div></div>'
-            f'<div class="rec-indicators">{inds_html}</div>'
-            f'<div class="rec-reasons">{reasons_html}</div>'
-            f'</div>',
+            f'<div style="font-size:0.65rem;color:#4ade80;text-align:center;'
+            f'padding:0.2rem 0;margin-bottom:0.35rem;">✓ 已在關注清單</div>',
             unsafe_allow_html=True,
         )
 
@@ -1037,43 +1142,139 @@ def render_scan_section():
     st.markdown(
         '<div class="scan-section">'
         '<div class="scan-header">'
-        '<div><div class="scan-title">🔍 台股<span>掃描推薦</span></div>'
-        '<div class="scan-subtitle">即時成交量前 200 名 · KD / MACD / RSI 綜合評分</div></div>'
+        '<div><div class="scan-title">🔍 台股<span>掃描瀏覽</span></div>'
+        '<div class="scan-subtitle">即時成交量前 200 名 · 全部結果可翻頁瀏覽</div></div>'
         '<span class="scan-badge">即時選股</span>'
         '</div>',
         unsafe_allow_html=True,
     )
 
-    # 快取結果存在 session_state，避免重複掃描
-    if "scan_results" not in st.session_state:
-        st.session_state.scan_results   = None
-        st.session_state.scan_timestamp = None
+    # session_state 初始化
+    for k, v in [("scan_results", None), ("scan_timestamp", None),
+                 ("scan_page", 0), ("scan_sort", "score"), ("scan_q", "")]:
+        if k not in st.session_state:
+            st.session_state[k] = v
 
+    # ── 掃描按鈕 ────────────────────────────────────────────
     col1, col2 = st.columns([3, 1])
     with col1:
         if st.session_state.scan_timestamp:
+            total_cnt = len(st.session_state.scan_results or [])
             st.markdown(
                 f'<div style="font-size:0.65rem;color:#475569;">'
-                f'上次掃描：{st.session_state.scan_timestamp}</div>',
+                f'上次掃描：{st.session_state.scan_timestamp}　共 {total_cnt} 筆</div>',
                 unsafe_allow_html=True,
             )
     with col2:
-        do_scan = st.button("▶ 開始掃描", key="scan_btn", use_container_width=True)
+        do_scan = st.button("▶ 掃描", key="scan_btn", use_container_width=True)
 
     if do_scan or st.session_state.scan_results is None:
         st.markdown(
             '<div style="font-size:0.7rem;color:#64748b;margin-bottom:0.4rem;">'
-            '正在抓取當日成交量前 200 名，並逐一進行技術分析…</div>',
+            '正在抓取當日成交量前 200 名，逐一進行技術分析…</div>',
             unsafe_allow_html=True,
         )
         progress_bar = st.progress(0)
         status_text  = st.empty()
-        top5 = run_market_scan_live(progress_bar, status_text, top_n=200)
-        st.session_state.scan_results   = top5
+        all_results  = run_market_scan_live(progress_bar, status_text, top_n=200)
+        st.session_state.scan_results   = all_results
         st.session_state.scan_timestamp = datetime.now().strftime("%m/%d %H:%M")
+        st.session_state.scan_page      = 0
         st.rerun()
+        return
+
+    all_results = st.session_state.scan_results or []
+    if not all_results:
+        st.markdown('<div class="no-data">目前無資料，請點掃描</div>', unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+        return
+
+    # ── 搜尋框 ──────────────────────────────────────────────
+    q = st.text_input(
+        "搜尋", placeholder="🔎  搜尋股票名稱或代碼…",
+        value=st.session_state.scan_q,
+        key="scan_search_input",
+        label_visibility="collapsed",
+    )
+    if q != st.session_state.scan_q:
+        st.session_state.scan_q    = q
+        st.session_state.scan_page = 0
+        st.rerun()
+
+    # ── 排序切換 ────────────────────────────────────────────
+    sort_options = {"score": "評分↓", "pct_desc": "漲幅↓", "pct_asc": "跌幅↓"}
+    sort_labels  = list(sort_options.values())
+    sort_keys    = list(sort_options.keys())
+    cur_sort_idx = sort_keys.index(st.session_state.scan_sort) if st.session_state.scan_sort in sort_keys else 0
+
+    sel = st.radio(
+        "排序", sort_labels,
+        index=cur_sort_idx,
+        horizontal=True,
+        key="scan_sort_radio",
+        label_visibility="collapsed",
+    )
+    new_sort = sort_keys[sort_labels.index(sel)]
+    if new_sort != st.session_state.scan_sort:
+        st.session_state.scan_sort = new_sort
+        st.session_state.scan_page = 0
+        st.rerun()
+
+    # ── 篩選 + 排序資料 ─────────────────────────────────────
+    data = all_results[:]
+    if q:
+        ql = q.lower()
+        data = [s for s in data if ql in s["name"].lower() or ql in s["code"].lower()]
+
+    if st.session_state.scan_sort == "pct_desc":
+        data.sort(key=lambda s: (s["close"]-s["prev"])/s["prev"] if s.get("prev") else 0, reverse=True)
+    elif st.session_state.scan_sort == "pct_asc":
+        data.sort(key=lambda s: (s["close"]-s["prev"])/s["prev"] if s.get("prev") else 0)
     else:
-        render_rec_cards(st.session_state.scan_results)
+        data.sort(key=lambda x: x["score"], reverse=True)
+
+    total     = len(data)
+    max_page  = max((total - 1) // PAGE_SIZE, 0)
+    page      = min(st.session_state.scan_page, max_page)
+    start     = page * PAGE_SIZE
+    end       = min(start + PAGE_SIZE, total)
+    page_data = data[start:end]
+
+    watchlist_ids = {s["id"] for s in st.session_state.watchlist}
+
+    st.markdown(
+        f'<div class="scan-stats">'
+        f'<span>共 {total} 筆結果</span>'
+        f'<span>第 {start+1}–{end} 筆</span>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+    # ── 逐筆顯示 ────────────────────────────────────────────
+    for i, s in enumerate(page_data):
+        global_rank = start + i + 1
+        render_scan_row(global_rank, s, s["code"] in watchlist_ids)
+
+    # ── 分頁導航 ────────────────────────────────────────────
+    st.markdown('<div class="page-nav">', unsafe_allow_html=True)
+    pc1, pc2, pc3 = st.columns([1, 2, 1])
+    with pc1:
+        if page > 0:
+            if st.button("◀ 上一頁", key="scan_prev", use_container_width=True):
+                st.session_state.scan_page = page - 1
+                st.rerun()
+    with pc2:
+        st.markdown(
+            f'<div class="page-info" style="text-align:center;padding-top:0.4rem;">'
+            f'{page+1} / {max_page+1} 頁</div>',
+            unsafe_allow_html=True,
+        )
+    with pc3:
+        if page < max_page:
+            if st.button("下一頁 ▶", key="scan_next", use_container_width=True):
+                st.session_state.scan_page = page + 1
+                st.rerun()
+    st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown('</div>', unsafe_allow_html=True)
     st.markdown(
@@ -1082,7 +1283,7 @@ def render_scan_section():
         unsafe_allow_html=True,
     )
 
-with st.expander("🔍 台股掃描推薦（即時成交量 Top 200）", expanded=False):
+with st.expander("🔍 台股掃描瀏覽（即時成交量 Top 200）", expanded=False):
     render_scan_section()
 
 # ── 股票清單 ──────────────────────────────────────────────
