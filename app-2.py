@@ -284,6 +284,11 @@ html, body, [data-testid="stAppViewContainer"] {
     background: linear-gradient(90deg,#38bdf8,#818cf8);
     width:var(--sw,50%);
 }
+.scan-progress-text {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.68rem; color: #64748b; text-align: center;
+    margin-top: 0.3rem; letter-spacing: 0.02em;
+}
 .rank-medal { font-size:0.9rem; margin-right:0.3rem; }
 .no-data { font-size: 0.75rem; color: #475569; text-align: center; padding: 0.5rem; font-style: italic; }
 .error-msg {
@@ -671,39 +676,95 @@ def score_stock(df, code):
                    "prev": float(df["Close"].iloc[-2])}
 
 
-# 台股掃描候選池
-SCAN_POOL = [
-    ("2330","台積電"), ("2317","鴻海"), ("2454","聯發科"), ("2382","廣達"),
-    ("2308","台達電"), ("2881","富邦金"), ("2882","國泰金"), ("2891","中信金"),
-    ("2886","兆豐金"), ("2884","玉山金"), ("2892","第一金"), ("2885","元大金"),
-    ("2302","聯電"),   ("2357","華碩"),   ("2379","瑞昱"),   ("2412","中華電"),
-    ("2002","中鋼"),   ("1301","台塑"),   ("1303","南亞"),   ("1326","台化"),
-    ("6505","台塑化"), ("3711","日月光投控"), ("3008","大立光"), ("3034","聯詠"),
-    ("2327","國巨"),   ("2059","川湖"),   ("5269","祥碩"),   ("6415","矽力-KY"),
-    ("2609","陽明"),   ("2615","萬海"),   ("2603","長榮"),   ("1590","亞德客"),
-    ("6669","緯穎"),   ("2344","華邦電"), ("4938","和碩"),   ("3045","台灣大"),
-    ("2912","統一超"), ("1216","統一"),   ("1101","台泥"),   ("0050","元大台灣50"),
-    ("0056","元大高股息"), ("00878","國泰永續高股息"), ("2408","南亞科"),
-]
+@st.cache_data(ttl=600)
+def fetch_twse_top_volume(top_n: int = 200) -> list[tuple[str, str]]:
+    """
+    從 TWSE 即時行情抓當日成交量前 top_n 支上市股票（純股票，排除 ETF/權證）。
+    回傳 [(code, name), ...]，按成交量降冪排列。
+    快取 10 分鐘。
+    """
+    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://mis.twse.com.tw/"}
+    result = []
+    try:
+        url = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_AVG_ALL"
+        r = requests.get(url, headers=headers, timeout=12)
+        data = r.json()
+        # data 是 list of dict: Code, Name, ClosingPrice, MonthlyAveragePrice
+        for item in data:
+            code = item.get("Code", "").strip()
+            name = item.get("Name", "").strip()
+            # 只保留 4 碼純數字（排除 ETF 如 0050/00878、權證等）
+            if _re.match(r'^\d{4}$', code) and name:
+                result.append((code, name))
+    except Exception:
+        pass
+
+    # 備援：若 openapi 抓不到，改用 TWSE 大盤即時行情 API 取成交量排名
+    if not result:
+        try:
+            url2 = "https://mis.twse.com.tw/stock/api/getCategory.jsp?ex=tse&i=MS&json=1"
+            r2 = requests.get(url2, headers=headers, timeout=12)
+            arr = r2.json().get("msgArray", [])
+            for item in arr:
+                code = item.get("c", "").strip()
+                name = item.get("n", "").strip()
+                vol_str = item.get("v", "0") or "0"
+                try:
+                    vol = float(vol_str)
+                except Exception:
+                    vol = 0
+                if _re.match(r'^\d{4}$', code) and name and vol > 0:
+                    result.append((code, name, vol))
+            result.sort(key=lambda x: x[2] if len(x) > 2 else 0, reverse=True)
+            result = [(c, n) for c, n, *_ in result]
+        except Exception:
+            pass
+
+    # 最多取 top_n 筆
+    return result[:top_n]
 
 
-@st.cache_data(ttl=1800)
-def run_market_scan():
-    """掃描台股池，回傳評分 Top 5"""
+def run_market_scan_live(progress_bar, status_text, top_n: int = 200):
+    """
+    即時掃描 TWSE 成交量前 top_n 名股票，帶進度回呼。
+    回傳評分 Top 5（不快取，由呼叫端控制）。
+    """
+    candidates = fetch_twse_top_volume(top_n)
+    if not candidates:
+        # 若 API 全失敗，回退到內建池
+        candidates = [
+            ("2330","台積電"), ("2317","鴻海"), ("2454","聯發科"), ("2382","廣達"),
+            ("2308","台達電"), ("2881","富邦金"), ("2882","國泰金"), ("2891","中信金"),
+            ("2886","兆豐金"), ("2884","玉山金"), ("2302","聯電"),   ("2357","華碩"),
+            ("2412","中華電"), ("2002","中鋼"),   ("1301","台塑"),   ("1303","南亞"),
+            ("6505","台塑化"), ("3711","日月光投控"), ("3008","大立光"), ("2327","國巨"),
+            ("2059","川湖"),   ("2609","陽明"),   ("2615","萬海"),   ("2603","長榮"),
+            ("6669","緯穎"),   ("4938","和碩"),   ("2912","統一超"), ("1101","台泥"),
+        ]
+
+    total   = len(candidates)
     results = []
-    for code, name in SCAN_POOL:
+
+    for i, (code, name) in enumerate(candidates):
+        # 更新進度
+        pct = (i + 1) / total
+        progress_bar.progress(pct)
+        status_text.markdown(
+            f'<div class="scan-progress-text">掃描中 {i+1}/{total}　{name}（{code}）</div>',
+            unsafe_allow_html=True,
+        )
         try:
             df = yf.Ticker(f"{code}.TW").history(period="6mo")
             if df is None or df.empty:
                 df = yf.Ticker(f"{code}.TWO").history(period="6mo")
             score, info = score_stock(df, code)
             if score is not None and score > 0:
-                results.append({
-                    "code": code, "name": name,
-                    "score": score, **info
-                })
+                results.append({"code": code, "name": name, "score": score, **info})
         except Exception:
             pass
+
+    progress_bar.progress(1.0)
+    status_text.empty()
     results.sort(key=lambda x: x["score"], reverse=True)
     return results[:5]
 
@@ -879,7 +940,7 @@ now = datetime.now().strftime("%Y/%m/%d %H:%M:%S")
 # ── 頂部標題 ─────────────────────────────────────────────
 st.markdown(
     '<div class="app-header">'
-    '<div class="app-title">📊 大師加持<span>開發v4版</span></div>'
+    '<div class="app-title">📊 大師加持<span>開發中v4版</span></div>'
     f'<div class="app-time"><span class="live-dot"></span>即時更新<br>{now}</div>'
     '</div>',
     unsafe_allow_html=True,
@@ -935,54 +996,84 @@ with st.expander("➕ 新增關注股票", expanded=False):
 # ── 市場掃描推薦 ──────────────────────────────────────────
 MEDALS = ["🥇","🥈","🥉","4️⃣","5️⃣"]
 
-def render_scan_section():
+def render_rec_cards(top5):
     SCORE_COLORS = ["#f59e0b","#94a3b8","#cd7f32","#38bdf8","#38bdf8"]
+    if not top5:
+        st.markdown('<div class="no-data">掃描完畢，目前無符合條件的股票</div>', unsafe_allow_html=True)
+        return
+    for i, s in enumerate(top5):
+        pct = (s["close"] - s["prev"]) / s["prev"] * 100 if s.get("prev") else 0
+        pct_color = "#ef4444" if pct > 0 else "#22c55e"
+        pct_str   = f"{'▲' if pct>0 else '▼'} {abs(pct):.2f}%"
+        sw        = min(s["score"], 100)
+        rc_color  = SCORE_COLORS[i] if i < len(SCORE_COLORS) else "#38bdf8"
+        reasons_html = "".join(
+            f'<span class="rec-reason">{r}</span>' for r in s.get("reasons", [])
+        )
+        inds_html = (
+            f'<span class="rec-ind">K {s["K"]:.0f}</span>'
+            f'<span class="rec-ind">D {s["D"]:.0f}</span>'
+            f'<span class="rec-ind">RSI {s["RSI"]:.0f}</span>'
+            f'<span class="rec-ind" style="color:{pct_color}">{pct_str}</span>'
+        )
+        st.markdown(
+            f'<div class="rec-card" style="--rc:{rc_color};">'
+            f'<div class="rec-top"><div>'
+            f'<div class="rec-name"><span class="rank-medal">{MEDALS[i]}</span>{s["name"]}</div>'
+            f'<div class="rec-code">{s["code"]} · TW</div>'
+            f'</div><div class="rec-score-wrap">'
+            f'<div class="rec-score">{s["score"]}</div>'
+            f'<div class="score-bar-wrap"><div class="score-bar-fill" style="--sw:{sw}%;"></div></div>'
+            f'<div class="rec-score-label">技術評分</div>'
+            f'</div></div>'
+            f'<div class="rec-indicators">{inds_html}</div>'
+            f'<div class="rec-reasons">{reasons_html}</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+
+def render_scan_section():
     st.markdown(
         '<div class="scan-section">'
         '<div class="scan-header">'
         '<div><div class="scan-title">🔍 台股<span>掃描推薦</span></div>'
-        '<div class="scan-subtitle">技術分析 · KD / MACD / RSI 綜合評分</div></div>'
-        '<span class="scan-badge">AI 選股</span>'
+        '<div class="scan-subtitle">即時成交量前 200 名 · KD / MACD / RSI 綜合評分</div></div>'
+        '<span class="scan-badge">即時選股</span>'
         '</div>',
         unsafe_allow_html=True,
     )
 
-    with st.spinner("掃描中，請稍候約 20–40 秒…"):
-        top5 = run_market_scan()
+    # 快取結果存在 session_state，避免重複掃描
+    if "scan_results" not in st.session_state:
+        st.session_state.scan_results   = None
+        st.session_state.scan_timestamp = None
 
-    if not top5:
-        st.markdown('<div class="no-data">目前無法取得資料，請稍後再試</div>', unsafe_allow_html=True)
-    else:
-        for i, s in enumerate(top5):
-            pct = (s["close"] - s["prev"]) / s["prev"] * 100 if s.get("prev") else 0
-            pct_color = "#ef4444" if pct > 0 else "#22c55e"
-            pct_str   = f"{'▲' if pct>0 else '▼'} {abs(pct):.2f}%"
-            sw        = min(s["score"], 100)
-            rc_color  = SCORE_COLORS[i] if i < len(SCORE_COLORS) else "#38bdf8"
-            reasons_html = "".join(
-                f'<span class="rec-reason">{r}</span>' for r in s.get("reasons", [])
-            )
-            inds_html = (
-                f'<span class="rec-ind">K {s["K"]:.0f}</span>'
-                f'<span class="rec-ind">D {s["D"]:.0f}</span>'
-                f'<span class="rec-ind">RSI {s["RSI"]:.0f}</span>'
-                f'<span class="rec-ind" style="color:{pct_color}">{pct_str}</span>'
-            )
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        if st.session_state.scan_timestamp:
             st.markdown(
-                f'<div class="rec-card" style="--rc:{rc_color};">'
-                f'<div class="rec-top"><div>'
-                f'<div class="rec-name"><span class="rank-medal">{MEDALS[i]}</span>{s["name"]}</div>'
-                f'<div class="rec-code">{s["code"]} · TW</div>'
-                f'</div><div class="rec-score-wrap">'
-                f'<div class="rec-score">{s["score"]}</div>'
-                f'<div class="score-bar-wrap"><div class="score-bar-fill" style="--sw:{sw}%;"></div></div>'
-                f'<div class="rec-score-label">技術評分</div>'
-                f'</div></div>'
-                f'<div class="rec-indicators">{inds_html}</div>'
-                f'<div class="rec-reasons">{reasons_html}</div>'
-                f'</div>',
+                f'<div style="font-size:0.65rem;color:#475569;">'
+                f'上次掃描：{st.session_state.scan_timestamp}</div>',
                 unsafe_allow_html=True,
             )
+    with col2:
+        do_scan = st.button("▶ 開始掃描", key="scan_btn", use_container_width=True)
+
+    if do_scan or st.session_state.scan_results is None:
+        st.markdown(
+            '<div style="font-size:0.7rem;color:#64748b;margin-bottom:0.4rem;">'
+            '正在抓取當日成交量前 200 名，並逐一進行技術分析…</div>',
+            unsafe_allow_html=True,
+        )
+        progress_bar = st.progress(0)
+        status_text  = st.empty()
+        top5 = run_market_scan_live(progress_bar, status_text, top_n=200)
+        st.session_state.scan_results   = top5
+        st.session_state.scan_timestamp = datetime.now().strftime("%m/%d %H:%M")
+        st.rerun()
+    else:
+        render_rec_cards(st.session_state.scan_results)
 
     st.markdown('</div>', unsafe_allow_html=True)
     st.markdown(
@@ -991,7 +1082,7 @@ def render_scan_section():
         unsafe_allow_html=True,
     )
 
-with st.expander("🔍 台股掃描推薦（技術分析選股）", expanded=False):
+with st.expander("🔍 台股掃描推薦（即時成交量 Top 200）", expanded=False):
     render_scan_section()
 
 # ── 股票清單 ──────────────────────────────────────────────
