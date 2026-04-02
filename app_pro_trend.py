@@ -818,58 +818,70 @@ def score_stock(df, code):
     }
 
 
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=3600)
 def fetch_twse_top_volume(top_n: int = 800) -> list[tuple[str, str]]:
     """
-    從 TWSE STOCK_DAY_ALL 抓當日所有上市股票，
-    按成交量降冪排列，回傳前 top_n 筆 [(code, name), ...]。
-    快取 10 分鐘。
+    抓取全市場上市＋上櫃股票清單（不受交易時間限制）。
+    來源：TWSE/OTC ISIN 清冊，任何時間都有效。
+    回傳 [(code, name), ...]，最多 top_n 筆。
     """
-    headers = {"User-Agent": "Mozilla/5.0"}
     result  = []
-    try:
-        url  = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
-        r    = requests.get(url, headers=headers, timeout=15)
-        data = r.json()
-        for item in data:
-            code = item.get("Code", "").strip()
-            name = item.get("Name", "").strip()
-            # 只保留 4 碼純數字（排除 ETF/權證）
-            if not _re.match(r'^\d{4}$', code) or not name:
-                continue
-            try:
-                vol = float(str(item.get("TradeVolume", "0")).replace(",", ""))
-            except Exception:
-                vol = 0
-            result.append((code, name, vol))
-        # 按成交量降冪
-        result.sort(key=lambda x: x[2], reverse=True)
-        result = [(c, n) for c, n, _ in result]
-    except Exception:
-        pass
+    headers = {"User-Agent": "Mozilla/5.0"}
 
-    # 備援：TWSE 即時行情 API
-    if not result:
+    # ── 主要來源：ISIN 清冊（上市 mode=2，上櫃 mode=4）────
+    for mode in ["2", "4"]:
         try:
-            url2 = "https://mis.twse.com.tw/stock/api/getCategory.jsp?ex=tse&i=MS&json=1"
-            r2   = requests.get(url2, headers=headers, timeout=12)
-            arr  = r2.json().get("msgArray", [])
-            tmp  = []
-            for item in arr:
-                code = item.get("c", "").strip()
-                name = item.get("n", "").strip()
-                try:
-                    vol = float(item.get("v", "0") or "0")
-                except Exception:
-                    vol = 0
-                if _re.match(r'^\d{4}$', code) and name and vol > 0:
-                    tmp.append((code, name, vol))
-            tmp.sort(key=lambda x: x[2], reverse=True)
-            result = [(c, n) for c, n, _ in tmp]
+            r = requests.get(
+                f"https://isin.twse.com.tw/isin/C_public.jsp?strMode={mode}",
+                headers=headers, timeout=15,
+            )
+            r.encoding = "big5"
+            rows = _re.findall(r'<tr[^>]*>(.*?)</tr>', r.text, _re.S)
+            for row in rows:
+                tds = _re.findall(r'<td[^>]*>(.*?)</td>', row, _re.S)
+                if not tds:
+                    continue
+                cell = _re.sub(r'<[^>]+>', '', tds[0]).strip()
+                # 分隔符：全形空格或一般空白
+                parts = cell.split('\u3000', 1) if '\u3000' in cell else cell.split(None, 1)
+                if len(parts) != 2:
+                    continue
+                code, name = parts[0].strip(), parts[1].strip()
+                # 只留 4 碼純數字（排除 ETF 00xx、權證 0xxxxx 等）
+                if _re.match(r'^\d{4}$', code) and name:
+                    result.append((code, name))
         except Exception:
             pass
 
-    return result[:top_n]
+    # 去重（上市/上櫃可能重疊）
+    seen   = set()
+    unique = []
+    for code, name in result:
+        if code not in seen:
+            seen.add(code)
+            unique.append((code, name))
+
+    # ── 備援：若 ISIN 失敗，改用 TWSE OpenAPI 當日清單 ──────
+    if not unique:
+        for url in [
+            "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL",
+            "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_AVG_ALL",
+        ]:
+            try:
+                r    = requests.get(url, headers=headers, timeout=15)
+                data = r.json()
+                for item in data:
+                    code = item.get("Code", "").strip()
+                    name = item.get("Name", "").strip()
+                    if _re.match(r'^\d{4}$', code) and name and code not in seen:
+                        seen.add(code)
+                        unique.append((code, name))
+                if unique:
+                    break
+            except Exception:
+                pass
+
+    return unique[:top_n]
 
 
 def run_market_scan_live(progress_bar, status_text, top_n: int = 800):
