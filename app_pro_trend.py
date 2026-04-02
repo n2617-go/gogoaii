@@ -708,80 +708,109 @@ def calculate_rsi(df, period=14):
 
 def score_stock(df, code):
     """
-    主流強勢股評分（0~100），整合新邏輯：
+    主流強勢股評分（0~100）：
       MA趨勢（30）＋ 接近新高（30）＋ 量能爆發（20）＋ 當日漲幅（20）
     同時附帶 KD/RSI 供顯示用。
     """
     if df is None or len(df) < 22:
         return None, {}
 
-    # 相容 yfinance MultiIndex columns
+    # ── 相容新版 yfinance MultiIndex columns ──────────────
+    # 新版結構：columns = MultiIndex[(Price, Ticker), ...]
+    # 例如 df["Close"] 可能是 MultiIndex，需先降維
     if isinstance(df.columns, pd.MultiIndex):
-        df = df.xs(code + ".TW", axis=1, level=1) if (code + ".TW") in df.columns.get_level_values(1) else df.droplevel(1, axis=1)
+        # level 0 = 欄位名稱 (Close/Open/…), level 1 = ticker
+        # 先嘗試用 ticker 取單支
+        tickers_in_col = df.columns.get_level_values(1).unique().tolist()
+        target = code + ".TW"
+        if target in tickers_in_col:
+            df = df.xs(target, axis=1, level=1)
+        elif len(tickers_in_col) == 1:
+            df = df.xs(tickers_in_col[0], axis=1, level=1)
+        else:
+            df = df.droplevel(1, axis=1)
 
     df = df.copy()
+    # 確保欄位名稱統一（有時會出現 Price/Adj Close 等變體）
+    df.columns = [str(c).strip() for c in df.columns]
+    close_col  = next((c for c in df.columns if "close" in c.lower() and "adj" not in c.lower()), None)
+    vol_col    = next((c for c in df.columns if "volume" in c.lower()), None)
+    high_col   = next((c for c in df.columns if "high"   in c.lower()), None)
+    low_col    = next((c for c in df.columns if "low"    in c.lower()), None)
+    if not close_col or not vol_col:
+        return None, {}
+
+    close  = df[close_col].dropna()
+    volume = df[vol_col].dropna()
+    high   = df[high_col].dropna() if high_col else close
+    low    = df[low_col].dropna()  if low_col  else close
+    if len(close) < 22:
+        return None, {}
 
     # ── 指標計算 ──────────────────────────────────────────
-    df["MA5"]    = df["Close"].rolling(5).mean()
-    df["MA20"]   = df["Close"].rolling(20).mean()
-    df["VolMA5"] = df["Volume"].rolling(5).mean()
+    ma5    = close.rolling(5).mean()
+    ma20   = close.rolling(20).mean()
+    volma5 = volume.rolling(5).mean()
 
     # KD（供顯示）
-    low_min  = df["Low"].rolling(9).min()
-    high_max = df["High"].rolling(9).max()
-    rng = high_max - low_min
-    rsv  = ((df["Close"] - low_min) / rng.replace(0, float("nan"))) * 100
-    df["K"] = rsv.ewm(com=2).mean()
-    df["D"] = df["K"].ewm(com=2).mean()
+    low_min  = low.rolling(9).min()
+    high_max = high.rolling(9).max()
+    rng      = (high_max - low_min).replace(0, float("nan"))
+    rsv      = (close - low_min) / rng * 100
+    k_series = rsv.ewm(com=2).mean()
+    d_series = k_series.ewm(com=2).mean()
 
     # RSI（供顯示）
-    delta = df["Close"].diff()
-    gain  = delta.clip(lower=0).rolling(14).mean()
-    loss  = (-delta.clip(upper=0)).rolling(14).mean()
-    rs    = gain / loss.replace(0, float("nan"))
-    df["RSI"] = 100 - (100 / (1 + rs))
+    delta    = close.diff()
+    gain     = delta.clip(lower=0).rolling(14).mean()
+    loss     = (-delta.clip(upper=0)).rolling(14).mean()
+    rs       = gain / loss.replace(0, float("nan"))
+    rsi_s    = 100 - (100 / (1 + rs))
 
-    l    = df.iloc[-1]
-    prev = df["Close"].iloc[-2] if len(df) >= 2 else l["Close"]
+    last_close  = float(close.iloc[-1])
+    prev_close  = float(close.iloc[-2]) if len(close) >= 2 else last_close
+    last_vol    = float(volume.iloc[-1])
+    last_volma5 = float(volma5.iloc[-1]) if pd.notna(volma5.iloc[-1]) else 0
+    last_ma5    = float(ma5.iloc[-1])    if pd.notna(ma5.iloc[-1])    else 0
+    last_ma20   = float(ma20.iloc[-1])   if pd.notna(ma20.iloc[-1])   else 0
+    last_k      = float(k_series.iloc[-1]) if pd.notna(k_series.iloc[-1]) else 50.0
+    last_d      = float(d_series.iloc[-1]) if pd.notna(d_series.iloc[-1]) else 50.0
+    last_rsi    = float(rsi_s.iloc[-1])    if pd.notna(rsi_s.iloc[-1])    else 50.0
+    high60      = float(close.tail(60).max())
 
     score   = 0
     reasons = []
+    change  = (last_close - prev_close) / prev_close if prev_close else 0
 
     # ① MA 趨勢：MA5 > MA20
-    if pd.notna(l["MA5"]) and pd.notna(l["MA20"]) and l["MA5"] > l["MA20"]:
+    if last_ma5 > 0 and last_ma20 > 0 and last_ma5 > last_ma20:
         score += 30
         reasons.append("均線多頭")
 
     # ② 接近 60 日新高（>= 97%）
-    high60 = df["Close"].tail(60).max()
-    if pd.notna(high60) and high60 > 0 and l["Close"] >= high60 * 0.97:
+    if high60 > 0 and last_close >= high60 * 0.97:
         score += 30
         reasons.append("逼近新高")
 
     # ③ 量能爆發：當日量 > 5日均量 × 1.5
-    if pd.notna(l["VolMA5"]) and l["VolMA5"] > 0 and l["Volume"] > l["VolMA5"] * 1.5:
+    if last_volma5 > 0 and last_vol > last_volma5 * 1.5:
         score += 20
         reasons.append("量能爆發")
 
-    # ④ 當日漲幅 > 3%
-    change = (l["Close"] - prev) / prev if prev else 0
+    # ④ 當日漲幅
     if change > 0.03:
         score += 20
-        reasons.append(f"強勢漲{change*100:.1f}%")
+        reasons.append(f"強漲{change*100:.1f}%")
     elif change > 0.01:
         score += 8
         reasons.append(f"小漲{change*100:.1f}%")
 
-    k_val   = float(l["K"])   if pd.notna(l["K"])   else 50.0
-    d_val   = float(l["D"])   if pd.notna(l["D"])   else 50.0
-    rsi_val = float(l["RSI"]) if pd.notna(l["RSI"]) else 50.0
-
     return score, {
-        "K": k_val, "D": d_val, "RSI": rsi_val,
-        "MACD_hist": change,        # 借用欄位存漲幅，供顯示
+        "K": last_k, "D": last_d, "RSI": last_rsi,
+        "MACD_hist": change,
         "reasons": reasons,
-        "close": float(l["Close"]),
-        "prev":  float(prev),
+        "close": last_close,
+        "prev":  prev_close,
     }
 
 
@@ -888,12 +917,19 @@ def run_market_scan_live(progress_bar, status_text, top_n: int = 800):
             )
             try:
                 ticker_key = f"{code}.TW"
-                if len(tickers) == 1:
-                    df = raw.copy()
-                elif ticker_key in raw.columns.get_level_values(0):
-                    df = raw[ticker_key].copy()
+
+                if isinstance(raw.columns, pd.MultiIndex):
+                    # 新版 yfinance：level 0 = 欄位(Close/…), level 1 = ticker
+                    tickers_lvl = raw.columns.get_level_values(1).unique().tolist()
+                    if ticker_key in tickers_lvl:
+                        df = raw.xs(ticker_key, axis=1, level=1).copy()
+                    elif len(tickers_lvl) == 1:
+                        df = raw.xs(tickers_lvl[0], axis=1, level=1).copy()
+                    else:
+                        continue
                 else:
-                    continue
+                    # 只有一支時 raw 已是普通 DataFrame
+                    df = raw.copy()
 
                 if df is None or df.empty or len(df) < 22:
                     continue
@@ -901,8 +937,8 @@ def run_market_scan_live(progress_bar, status_text, top_n: int = 800):
                 score, info = score_stock(df, code)
                 if score is None:
                     continue
-                # 門檻：score > 50（至少命中兩項條件）
-                if score > 50:
+                # 門檻降為 30 分（命中任一條件即列入）
+                if score >= 30:
                     results.append({"code": code, "name": name, "score": score, **info})
             except Exception:
                 continue
