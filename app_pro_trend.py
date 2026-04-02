@@ -733,10 +733,14 @@ def score_stock(df, code):
     df = df.copy()
     # 確保欄位名稱統一（有時會出現 Price/Adj Close 等變體）
     df.columns = [str(c).strip() for c in df.columns]
-    close_col  = next((c for c in df.columns if "close" in c.lower() and "adj" not in c.lower()), None)
-    vol_col    = next((c for c in df.columns if "volume" in c.lower()), None)
-    high_col   = next((c for c in df.columns if "high"   in c.lower()), None)
-    low_col    = next((c for c in df.columns if "low"    in c.lower()), None)
+    close_col  = next((c for c in df.columns if c.lower() == "close"), None) or \
+                 next((c for c in df.columns if "close" in c.lower() and "adj" not in c.lower()), None)
+    vol_col    = next((c for c in df.columns if c.lower() == "volume"), None) or \
+                 next((c for c in df.columns if "volume" in c.lower()), None)
+    high_col   = next((c for c in df.columns if c.lower() == "high"), None) or \
+                 next((c for c in df.columns if "high" in c.lower()), None)
+    low_col    = next((c for c in df.columns if c.lower() == "low"), None) or \
+                 next((c for c in df.columns if "low" in c.lower()), None)
     if not close_col or not vol_col:
         return None, {}
 
@@ -871,80 +875,78 @@ def fetch_twse_top_volume(top_n: int = 800) -> list[tuple[str, str]]:
 def run_market_scan_live(progress_bar, status_text, top_n: int = 800):
     """
     掃描 TWSE 成交量前 top_n 名股票。
-    使用 yf.download 批次下載加速，帶即時進度顯示。
-    回傳全部有效結果（score >= 0），由 UI 層分頁。
+    逐支用 yf.Ticker().history() 下載，避免新版 yfinance batch MultiIndex 問題。
     """
     candidates = fetch_twse_top_volume(top_n)
+
+    # 顯示抓到的清單數量
+    status_text.markdown(
+        f'<div class="scan-progress-text">📋 抓到股票清單 {len(candidates)} 筆，開始技術分析…</div>',
+        unsafe_allow_html=True,
+    )
+    time.sleep(0.5)
+
     if not candidates:
+        status_text.markdown(
+            '<div class="scan-progress-text" style="color:#ef4444;">⚠️ 無法取得股票清單，改用內建備援清單</div>',
+            unsafe_allow_html=True,
+        )
         candidates = [
             ("2330","台積電"), ("2317","鴻海"), ("2454","聯發科"), ("2382","廣達"),
             ("2308","台達電"), ("2881","富邦金"), ("2882","國泰金"), ("2891","中信金"),
             ("2002","中鋼"),   ("1301","台塑"),   ("2603","長榮"),  ("6669","緯穎"),
+            ("2382","廣達"),   ("6505","台塑化"), ("3711","日月光投控"), ("2327","國巨"),
         ]
 
-    total    = len(candidates)
-    results  = []
-    BATCH    = 50   # 每批下載數量
+    total   = len(candidates)
+    results = []
+    skip    = 0
+    hit     = 0
 
-    for batch_start in range(0, total, BATCH):
-        batch      = candidates[batch_start: batch_start + BATCH]
-        tickers    = [f"{c}.TW" for c, _ in batch]
-        batch_end  = min(batch_start + BATCH, total)
-
-        # 更新進度
-        pct = batch_start / total
+    for i, (code, name) in enumerate(candidates):
+        pct = (i + 1) / total
         progress_bar.progress(pct)
         status_text.markdown(
             f'<div class="scan-progress-text">'
-            f'下載中 {batch_start+1}–{batch_end}/{total}…</div>',
+            f'分析 {i+1}/{total}　{name}（{code}）　✅{hit} 筆　⬜{skip} 筆略過</div>',
             unsafe_allow_html=True,
         )
 
-        try:
-            # 批次下載 2 個月歷史
-            raw = yf.download(tickers, period="2mo", progress=False, group_by="ticker")
-        except Exception:
+        df = None
+        # 先試上市(.TW)，再試上櫃(.TWO)
+        for suffix in [".TW", ".TWO"]:
+            try:
+                tmp = yf.Ticker(f"{code}{suffix}").history(period="2mo")
+                if tmp is not None and not tmp.empty and len(tmp) >= 22:
+                    df = tmp
+                    break
+            except Exception:
+                pass
+
+        if df is None:
+            skip += 1
             continue
 
-        for j, (code, name) in enumerate(batch):
-            global_idx = batch_start + j
-            pct2 = (global_idx + 1) / total
-            progress_bar.progress(pct2)
-            status_text.markdown(
-                f'<div class="scan-progress-text">'
-                f'分析 {global_idx+1}/{total}　{name}（{code}）</div>',
-                unsafe_allow_html=True,
-            )
-            try:
-                ticker_key = f"{code}.TW"
-
-                if isinstance(raw.columns, pd.MultiIndex):
-                    # 新版 yfinance：level 0 = 欄位(Close/…), level 1 = ticker
-                    tickers_lvl = raw.columns.get_level_values(1).unique().tolist()
-                    if ticker_key in tickers_lvl:
-                        df = raw.xs(ticker_key, axis=1, level=1).copy()
-                    elif len(tickers_lvl) == 1:
-                        df = raw.xs(tickers_lvl[0], axis=1, level=1).copy()
-                    else:
-                        continue
-                else:
-                    # 只有一支時 raw 已是普通 DataFrame
-                    df = raw.copy()
-
-                if df is None or df.empty or len(df) < 22:
-                    continue
-
-                score, info = score_stock(df, code)
-                if score is None:
-                    continue
-                # 門檻降為 30 分（命中任一條件即列入）
-                if score >= 30:
-                    results.append({"code": code, "name": name, "score": score, **info})
-            except Exception:
+        try:
+            score, info = score_stock(df, code)
+            if score is None:
+                skip += 1
                 continue
+            if score >= 30:
+                hit += 1
+                results.append({"code": code, "name": name, "score": score, **info})
+            else:
+                skip += 1
+        except Exception:
+            skip += 1
+            continue
 
     progress_bar.progress(1.0)
-    status_text.empty()
+    status_text.markdown(
+        f'<div class="scan-progress-text" style="color:#4ade80;">'
+        f'✅ 掃描完成！共找到 {len(results)} 筆符合條件的股票</div>',
+        unsafe_allow_html=True,
+    )
     results.sort(key=lambda x: x["score"], reverse=True)
     return results
 
