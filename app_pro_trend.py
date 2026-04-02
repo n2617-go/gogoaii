@@ -2,6 +2,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 import requests
 import yfinance as yf
+import pandas as pd
 from datetime import datetime
 import time
 import json
@@ -705,238 +706,211 @@ def calculate_rsi(df, period=14):
     return df
 
 
-
-
-def calculate_ma(df):
-    df["MA5"] = df["Close"].rolling(5).mean()
-    df["MA20"] = df["Close"].rolling(20).mean()
-    df["MA60"] = df["Close"].rolling(60).mean()
-    df["VolMA20"] = df["Volume"].rolling(20).mean()
-    return df
-
-
-
-
-def early_breakout_score(df):
-    if df is None or len(df) < 60:
-        return None, []
-
-    df = calculate_ma(df)
-
-    l = df.iloc[-1]
-
-    score = 0
-    reasons = []
-
-    # 均線收斂
-    if abs(l["MA20"] - l["MA60"]) / l["MA60"] < 0.03:
-        score += 25
-        reasons.append("均線收斂")
-
-    # 價格站上MA20
-    if l["Close"] > l["MA20"]:
-        score += 20
-        reasons.append("站上MA20")
-
-    # 溫和放量
-    if l["Volume"] > l["VolMA20"] * 1.2:
-        score += 20
-        reasons.append("量能增溫")
-
-    # 波動收斂
-    recent_range = (df["High"].rolling(20).max() - df["Low"].rolling(20).min()) / df["Close"]
-    if recent_range.iloc[-1] < 0.1:
-        score += 20
-        reasons.append("波動收斂")
-
-    return score, reasons
-def breakout_score(df):
-    if df is None or len(df) < 60:
-        return None, []
-
-    df = calculate_ma(df)
-
-    l = df.iloc[-1]
-    p = df.iloc[-2]
-
-    score = 0
-    reasons = []
-
-    if l["Close"] < l["MA20"]:
-        return 0, []
-
-    if l["Close"] > l["MA20"] > l["MA60"]:
-        score += 30
-        reasons.append("多頭排列")
-
-    if l["Close"] >= df["Close"].rolling(60).max().iloc[-1]:
-        score += 30
-        reasons.append("突破新高")
-
-    if l["Volume"] > l["VolMA20"] * 1.5:
-        score += 20
-        reasons.append("爆量")
-
-    if l["MA20"] > p["MA20"]:
-        score += 20
-        reasons.append("均線上彎")
-
-    return score, reasons
 def score_stock(df, code):
-    """計算技術面評分（0~100），越高越適合買入"""
-    if df is None or len(df) < 30:
+    """
+    主流強勢股評分（0~100），整合新邏輯：
+      MA趨勢（30）＋ 接近新高（30）＋ 量能爆發（20）＋ 當日漲幅（20）
+    同時附帶 KD/RSI 供顯示用。
+    """
+    if df is None or len(df) < 22:
         return None, {}
-    df = calculate_kd(df)
-    df = calculate_momentum(df)
-    df = calculate_macd(df)
-    df = calculate_rsi(df)
 
-    l, p = df.iloc[-1], df.iloc[-2]
-    score = 0
+    # 相容 yfinance MultiIndex columns
+    if isinstance(df.columns, pd.MultiIndex):
+        df = df.xs(code + ".TW", axis=1, level=1) if (code + ".TW") in df.columns.get_level_values(1) else df.droplevel(1, axis=1)
+
+    df = df.copy()
+
+    # ── 指標計算 ──────────────────────────────────────────
+    df["MA5"]    = df["Close"].rolling(5).mean()
+    df["MA20"]   = df["Close"].rolling(20).mean()
+    df["VolMA5"] = df["Volume"].rolling(5).mean()
+
+    # KD（供顯示）
+    low_min  = df["Low"].rolling(9).min()
+    high_max = df["High"].rolling(9).max()
+    rng = high_max - low_min
+    rsv  = ((df["Close"] - low_min) / rng.replace(0, float("nan"))) * 100
+    df["K"] = rsv.ewm(com=2).mean()
+    df["D"] = df["K"].ewm(com=2).mean()
+
+    # RSI（供顯示）
+    delta = df["Close"].diff()
+    gain  = delta.clip(lower=0).rolling(14).mean()
+    loss  = (-delta.clip(upper=0)).rolling(14).mean()
+    rs    = gain / loss.replace(0, float("nan"))
+    df["RSI"] = 100 - (100 / (1 + rs))
+
+    l    = df.iloc[-1]
+    prev = df["Close"].iloc[-2] if len(df) >= 2 else l["Close"]
+
+    score   = 0
     reasons = []
 
-    # KD 黃金交叉
-    if p["K"] < p["D"] and l["K"] > l["D"]:
+    # ① MA 趨勢：MA5 > MA20
+    if pd.notna(l["MA5"]) and pd.notna(l["MA20"]) and l["MA5"] > l["MA20"]:
         score += 30
-        reasons.append("KD黃金交叉")
-    # KD 超賣回升（K < 30）
-    if l["K"] < 30:
-        score += 15
-        reasons.append(f"KD超賣(K={l['K']:.0f})")
-    elif l["K"] < 50:
-        score += 8
+        reasons.append("均線多頭")
 
-    # MACD 翻多
-    if p["MACD_hist"] < 0 and l["MACD_hist"] > 0:
-        score += 25
-        reasons.append("MACD翻多")
-    elif l["MACD_hist"] > 0 and l["MACD"] > l["MACD_signal"]:
-        score += 10
-        reasons.append("MACD多頭")
+    # ② 接近 60 日新高（>= 97%）
+    high60 = df["Close"].tail(60).max()
+    if pd.notna(high60) and high60 > 0 and l["Close"] >= high60 * 0.97:
+        score += 30
+        reasons.append("逼近新高")
 
-    # RSI 超賣
-    rsi = l["RSI"]
-    if 30 <= rsi <= 50:
+    # ③ 量能爆發：當日量 > 5日均量 × 1.5
+    if pd.notna(l["VolMA5"]) and l["VolMA5"] > 0 and l["Volume"] > l["VolMA5"] * 1.5:
         score += 20
-        reasons.append(f"RSI低檔({rsi:.0f})")
-    elif rsi < 30:
-        score += 15
-        reasons.append(f"RSI超賣({rsi:.0f})")
+        reasons.append("量能爆發")
 
-    # 動能正向
-    if l["Momentum"] > 0:
-        score += 10
-        reasons.append("動能正向")
+    # ④ 當日漲幅 > 3%
+    change = (l["Close"] - prev) / prev if prev else 0
+    if change > 0.03:
+        score += 20
+        reasons.append(f"強勢漲{change*100:.1f}%")
+    elif change > 0.01:
+        score += 8
+        reasons.append(f"小漲{change*100:.1f}%")
 
-    return score, {"K": l["K"], "D": l["D"], "RSI": rsi,
-                   "MACD_hist": l["MACD_hist"], "reasons": reasons,
-                   "close": float(df["Close"].iloc[-1]),
-                   "prev": float(df["Close"].iloc[-2])}
+    k_val   = float(l["K"])   if pd.notna(l["K"])   else 50.0
+    d_val   = float(l["D"])   if pd.notna(l["D"])   else 50.0
+    rsi_val = float(l["RSI"]) if pd.notna(l["RSI"]) else 50.0
+
+    return score, {
+        "K": k_val, "D": d_val, "RSI": rsi_val,
+        "MACD_hist": change,        # 借用欄位存漲幅，供顯示
+        "reasons": reasons,
+        "close": float(l["Close"]),
+        "prev":  float(prev),
+    }
 
 
 @st.cache_data(ttl=600)
-def fetch_twse_top_volume(top_n: int = 200) -> list[tuple[str, str]]:
+def fetch_twse_top_volume(top_n: int = 800) -> list[tuple[str, str]]:
     """
-    從 TWSE 即時行情抓當日成交量前 top_n 支上市股票（純股票，排除 ETF/權證）。
-    回傳 [(code, name), ...]，按成交量降冪排列。
+    從 TWSE STOCK_DAY_ALL 抓當日所有上市股票，
+    按成交量降冪排列，回傳前 top_n 筆 [(code, name), ...]。
     快取 10 分鐘。
     """
-    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://mis.twse.com.tw/"}
-    result = []
+    headers = {"User-Agent": "Mozilla/5.0"}
+    result  = []
     try:
-        url = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_AVG_ALL"
-        r = requests.get(url, headers=headers, timeout=12)
+        url  = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
+        r    = requests.get(url, headers=headers, timeout=15)
         data = r.json()
-        # data 是 list of dict: Code, Name, ClosingPrice, MonthlyAveragePrice
         for item in data:
             code = item.get("Code", "").strip()
             name = item.get("Name", "").strip()
-            # 只保留 4 碼純數字（排除 ETF 如 0050/00878、權證等）
-            if _re.match(r'^\d{4}$', code) and name:
-                result.append((code, name))
+            # 只保留 4 碼純數字（排除 ETF/權證）
+            if not _re.match(r'^\d{4}$', code) or not name:
+                continue
+            try:
+                vol = float(str(item.get("TradeVolume", "0")).replace(",", ""))
+            except Exception:
+                vol = 0
+            result.append((code, name, vol))
+        # 按成交量降冪
+        result.sort(key=lambda x: x[2], reverse=True)
+        result = [(c, n) for c, n, _ in result]
     except Exception:
         pass
 
-    # 備援：若 openapi 抓不到，改用 TWSE 大盤即時行情 API 取成交量排名
+    # 備援：TWSE 即時行情 API
     if not result:
         try:
             url2 = "https://mis.twse.com.tw/stock/api/getCategory.jsp?ex=tse&i=MS&json=1"
-            r2 = requests.get(url2, headers=headers, timeout=12)
-            arr = r2.json().get("msgArray", [])
+            r2   = requests.get(url2, headers=headers, timeout=12)
+            arr  = r2.json().get("msgArray", [])
+            tmp  = []
             for item in arr:
                 code = item.get("c", "").strip()
                 name = item.get("n", "").strip()
-                vol_str = item.get("v", "0") or "0"
                 try:
-                    vol = float(vol_str)
+                    vol = float(item.get("v", "0") or "0")
                 except Exception:
                     vol = 0
                 if _re.match(r'^\d{4}$', code) and name and vol > 0:
-                    result.append((code, name, vol))
-            result.sort(key=lambda x: x[2] if len(x) > 2 else 0, reverse=True)
-            result = [(c, n) for c, n, *_ in result]
+                    tmp.append((code, name, vol))
+            tmp.sort(key=lambda x: x[2], reverse=True)
+            result = [(c, n) for c, n, _ in tmp]
         except Exception:
             pass
 
-    # 最多取 top_n 筆
     return result[:top_n]
 
 
-def run_market_scan_live(progress_bar, status_text, top_n: int = 200):
+def run_market_scan_live(progress_bar, status_text, top_n: int = 800):
     """
-    即時掃描 TWSE 成交量前 top_n 名股票，帶進度回呼。
-    回傳評分 Top 5（不快取，由呼叫端控制）。
+    掃描 TWSE 成交量前 top_n 名股票。
+    使用 yf.download 批次下載加速，帶即時進度顯示。
+    回傳全部有效結果（score >= 0），由 UI 層分頁。
     """
     candidates = fetch_twse_top_volume(top_n)
     if not candidates:
-        # 若 API 全失敗，回退到內建池
         candidates = [
             ("2330","台積電"), ("2317","鴻海"), ("2454","聯發科"), ("2382","廣達"),
             ("2308","台達電"), ("2881","富邦金"), ("2882","國泰金"), ("2891","中信金"),
-            ("2886","兆豐金"), ("2884","玉山金"), ("2302","聯電"),   ("2357","華碩"),
-            ("2412","中華電"), ("2002","中鋼"),   ("1301","台塑"),   ("1303","南亞"),
-            ("6505","台塑化"), ("3711","日月光投控"), ("3008","大立光"), ("2327","國巨"),
-            ("2059","川湖"),   ("2609","陽明"),   ("2615","萬海"),   ("2603","長榮"),
-            ("6669","緯穎"),   ("4938","和碩"),   ("2912","統一超"), ("1101","台泥"),
+            ("2002","中鋼"),   ("1301","台塑"),   ("2603","長榮"),  ("6669","緯穎"),
         ]
 
-    total   = len(candidates)
-    results = []
+    total    = len(candidates)
+    results  = []
+    BATCH    = 50   # 每批下載數量
 
-    for i, (code, name) in enumerate(candidates):
+    for batch_start in range(0, total, BATCH):
+        batch      = candidates[batch_start: batch_start + BATCH]
+        tickers    = [f"{c}.TW" for c, _ in batch]
+        batch_end  = min(batch_start + BATCH, total)
+
         # 更新進度
-        pct = (i + 1) / total
+        pct = batch_start / total
         progress_bar.progress(pct)
         status_text.markdown(
-            f'<div class="scan-progress-text">掃描中 {i+1}/{total}　{name}（{code}）</div>',
+            f'<div class="scan-progress-text">'
+            f'下載中 {batch_start+1}–{batch_end}/{total}…</div>',
             unsafe_allow_html=True,
         )
-        try:
-            df = yf.Ticker(f"{code}.TW").history(period="6mo")
-            if df is None or df.empty:
-                df = yf.Ticker(f"{code}.TWO").history(period="6mo")
-            tech_score, info = score_stock(df, code)
-            trend_score, trend_reasons = breakout_score(df)
-            total_score = (tech_score or 0) + (trend_score or 0)
 
-            if total_score > 0:
-                results.append({
-                    "code": code,
-                    "name": name,
-                    "score": total_score,
-                    "trend_reasons": trend_reasons,
-                    "early_reasons": early_reasons,
-                    **(info or {})
-                })
-            if score is not None and score > 0:
-                results.append({"code": code, "name": name, "score": score, **info})
+        try:
+            # 批次下載 2 個月歷史
+            raw = yf.download(tickers, period="2mo", progress=False, group_by="ticker")
         except Exception:
-            pass
+            continue
+
+        for j, (code, name) in enumerate(batch):
+            global_idx = batch_start + j
+            pct2 = (global_idx + 1) / total
+            progress_bar.progress(pct2)
+            status_text.markdown(
+                f'<div class="scan-progress-text">'
+                f'分析 {global_idx+1}/{total}　{name}（{code}）</div>',
+                unsafe_allow_html=True,
+            )
+            try:
+                ticker_key = f"{code}.TW"
+                if len(tickers) == 1:
+                    df = raw.copy()
+                elif ticker_key in raw.columns.get_level_values(0):
+                    df = raw[ticker_key].copy()
+                else:
+                    continue
+
+                if df is None or df.empty or len(df) < 22:
+                    continue
+
+                score, info = score_stock(df, code)
+                if score is None:
+                    continue
+                # 門檻：score > 50（至少命中兩項條件）
+                if score > 50:
+                    results.append({"code": code, "name": name, "score": score, **info})
+            except Exception:
+                continue
 
     progress_bar.progress(1.0)
     status_text.empty()
     results.sort(key=lambda x: x["score"], reverse=True)
-    return results   # 回傳全部，由 UI 層決定顯示幾筆
+    return results
 
 
 def analyze_signal(df):
@@ -1187,7 +1161,7 @@ def render_scan_row(rank, s, in_watchlist):
     bar_color = _score_bar_color(sc)
     sr_color  = sc_color
 
-    reasons = (s.get("reasons", []) or []) + (s.get("trend_reasons", []) or []) + (s.get("early_reasons", []) or [])
+    reasons = s.get("reasons", [])
     if reasons:
         chips = "".join(f'<span class="scan-sig-chip">{r}</span>' for r in reasons)
     else:
@@ -1231,8 +1205,8 @@ def render_scan_section():
     st.markdown(
         '<div class="scan-section">'
         '<div class="scan-header">'
-        '<div><div class="scan-title">🔍 台股<span>掃描瀏覽</span></div>'
-        '<div class="scan-subtitle">即時成交量前 200 名 · 全部結果可翻頁瀏覽</div></div>'
+        '<div><div class="scan-title">🔥 主流股<span>強勢掃描</span></div>'
+        '<div class="scan-subtitle">全市場上市股 · MA趨勢＋新高＋量能＋漲幅 綜合評分</div></div>'
         '<span class="scan-badge">即時選股</span>'
         '</div>',
         unsafe_allow_html=True,
@@ -1260,12 +1234,12 @@ def render_scan_section():
     if do_scan or st.session_state.scan_results is None:
         st.markdown(
             '<div style="font-size:0.7rem;color:#64748b;margin-bottom:0.4rem;">'
-            '正在抓取當日成交量前 200 名，逐一進行技術分析…</div>',
+            '正在抓取全市場上市股清單，以批次方式進行技術分析…</div>',
             unsafe_allow_html=True,
         )
         progress_bar = st.progress(0)
         status_text  = st.empty()
-        all_results  = run_market_scan_live(progress_bar, status_text, top_n=200)
+        all_results  = run_market_scan_live(progress_bar, status_text, top_n=800)
         st.session_state.scan_results   = all_results
         st.session_state.scan_timestamp = datetime.now().strftime("%m/%d %H:%M")
         st.session_state.scan_page      = 0
@@ -1372,7 +1346,7 @@ def render_scan_section():
         unsafe_allow_html=True,
     )
 
-with st.expander("🔍 台股掃描瀏覽（即時成交量 Top 200）", expanded=False):
+with st.expander("🔥 主流強勢股掃描（全市場上市股）", expanded=False):
     render_scan_section()
 
 # ── 股票清單 ──────────────────────────────────────────────
