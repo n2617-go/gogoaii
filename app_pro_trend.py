@@ -821,94 +821,95 @@ def score_stock(df, code):
 @st.cache_data(ttl=3600)
 def fetch_twse_top_volume(top_n: int = 800) -> list[tuple[str, str]]:
     """
-    抓取全市場上市＋上櫃股票清單（不受交易時間限制）。
-    來源：TWSE/OTC ISIN 清冊，任何時間都有效。
-    回傳 [(code, name), ...]，最多 top_n 筆。
+    抓取全市場上市＋上櫃股票清單（JSON API，不依賴 HTML 解析）。
+    多個來源依序嘗試，任一成功即回傳。
     """
-    result  = []
     headers = {"User-Agent": "Mozilla/5.0"}
+    seen    = set()
+    result  = []
 
-    # ── 主要來源：ISIN 清冊（上市 mode=2，上櫃 mode=4）────
-    for mode in ["2", "4"]:
+    apis = [
+        # 上市：每月交易統計（有 Code/Name，全年都有資料）
+        ("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL",     "Code", "Name"),
+        # 上市：月平均（備援）
+        ("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_AVG_ALL", "Code", "Name"),
+        # 上櫃：TPEx OpenAPI
+        ("https://openapi.twse.com.tw/v1/exchangeReport/MI_INDEX",          "Code", "Name"),
+    ]
+
+    for url, code_key, name_key in apis:
         try:
-            r = requests.get(
-                f"https://isin.twse.com.tw/isin/C_public.jsp?strMode={mode}",
-                headers=headers, timeout=15,
-            )
-            r.encoding = "big5"
-            rows = _re.findall(r'<tr[^>]*>(.*?)</tr>', r.text, _re.S)
-            for row in rows:
-                tds = _re.findall(r'<td[^>]*>(.*?)</td>', row, _re.S)
-                if not tds:
-                    continue
-                cell = _re.sub(r'<[^>]+>', '', tds[0]).strip()
-                # 分隔符：全形空格或一般空白
-                parts = cell.split('\u3000', 1) if '\u3000' in cell else cell.split(None, 1)
-                if len(parts) != 2:
-                    continue
-                code, name = parts[0].strip(), parts[1].strip()
-                # 只留 4 碼純數字（排除 ETF 00xx、權證 0xxxxx 等）
-                if _re.match(r'^\d{4}$', code) and name:
+            r    = requests.get(url, headers=headers, timeout=15)
+            data = r.json()
+            if not isinstance(data, list) or len(data) == 0:
+                continue
+            for item in data:
+                code = str(item.get(code_key, "")).strip()
+                name = str(item.get(name_key, "")).strip()
+                if _re.match(r'^\d{4}$', code) and name and code not in seen:
+                    seen.add(code)
                     result.append((code, name))
         except Exception:
-            pass
+            continue
 
-    # 去重（上市/上櫃可能重疊）
-    seen   = set()
-    unique = []
-    for code, name in result:
-        if code not in seen:
-            seen.add(code)
-            unique.append((code, name))
+    # 上櫃 TPEx
+    tpex_apis = [
+        "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes",
+        "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_peratio_analysis",
+    ]
+    for url in tpex_apis:
+        try:
+            r    = requests.get(url, headers=headers, timeout=15)
+            data = r.json()
+            if not isinstance(data, list) or len(data) == 0:
+                continue
+            for item in data:
+                code = str(item.get("SecuritiesCompanyCode", item.get("Code", ""))).strip()
+                name = str(item.get("CompanyName", item.get("Name", ""))).strip()
+                if _re.match(r'^\d{4}$', code) and name and code not in seen:
+                    seen.add(code)
+                    result.append((code, name))
+            if result:
+                break
+        except Exception:
+            continue
 
-    # ── 備援：若 ISIN 失敗，改用 TWSE OpenAPI 當日清單 ──────
-    if not unique:
-        for url in [
-            "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL",
-            "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_AVG_ALL",
-        ]:
-            try:
-                r    = requests.get(url, headers=headers, timeout=15)
-                data = r.json()
-                for item in data:
-                    code = item.get("Code", "").strip()
-                    name = item.get("Name", "").strip()
-                    if _re.match(r'^\d{4}$', code) and name and code not in seen:
-                        seen.add(code)
-                        unique.append((code, name))
-                if unique:
-                    break
-            except Exception:
-                pass
-
-    return unique[:top_n]
+    return result[:top_n]
 
 
 def run_market_scan_live(progress_bar, status_text, top_n: int = 800):
     """
-    掃描 TWSE 成交量前 top_n 名股票。
-    逐支用 yf.Ticker().history() 下載，避免新版 yfinance batch MultiIndex 問題。
+    掃描全市場股票，逐支用 yf.Ticker().history() 下載分析。
     """
     candidates = fetch_twse_top_volume(top_n)
+    n_cand     = len(candidates)
 
-    # 顯示抓到的清單數量
-    status_text.markdown(
-        f'<div class="scan-progress-text">📋 抓到股票清單 {len(candidates)} 筆，開始技術分析…</div>',
-        unsafe_allow_html=True,
-    )
-    time.sleep(0.5)
-
-    if not candidates:
+    if n_cand == 0:
+        # 所有 API 都失敗 → 用內建清單
         status_text.markdown(
-            '<div class="scan-progress-text" style="color:#ef4444;">⚠️ 無法取得股票清單，改用內建備援清單</div>',
+            '<div class="scan-progress-text" style="color:#ef4444;">'
+            '⚠️ 所有股票清單 API 均失敗，使用內建備援清單（16 筆）</div>',
             unsafe_allow_html=True,
         )
         candidates = [
             ("2330","台積電"), ("2317","鴻海"), ("2454","聯發科"), ("2382","廣達"),
             ("2308","台達電"), ("2881","富邦金"), ("2882","國泰金"), ("2891","中信金"),
             ("2002","中鋼"),   ("1301","台塑"),   ("2603","長榮"),  ("6669","緯穎"),
-            ("2382","廣達"),   ("6505","台塑化"), ("3711","日月光投控"), ("2327","國巨"),
+            ("6505","台塑化"), ("3711","日月光投控"), ("2327","國巨"), ("3008","大立光"),
         ]
+    elif n_cand < 100:
+        status_text.markdown(
+            f'<div class="scan-progress-text" style="color:#f59e0b;">'
+            f'⚠️ 只抓到 {n_cand} 筆（API 可能在非交易時間回傳空資料），建議稍後再試</div>',
+            unsafe_allow_html=True,
+        )
+        time.sleep(1)
+    else:
+        status_text.markdown(
+            f'<div class="scan-progress-text">📋 成功抓到 {n_cand} 筆股票，開始逐一分析…</div>',
+            unsafe_allow_html=True,
+        )
+        time.sleep(0.3)
 
     total   = len(candidates)
     results = []
