@@ -819,57 +819,67 @@ def score_stock(df, code):
 
 
 @st.cache_data(ttl=3600)
-def fetch_twse_top_volume(top_n: int = 800) -> list[tuple[str, str]]:
+def fetch_twse_top_volume(top_n: int = 1800) -> list[tuple[str, str]]:
     """
-    抓取全市場上市＋上櫃股票清單（JSON API，不依賴 HTML 解析）。
-    多個來源依序嘗試，任一成功即回傳。
+    抓取全市場上市＋上櫃股票清單（JSON API）。
+    上市來源：TWSE OpenAPI
+    上櫃來源：TPEx OpenAPI
+    任何時間都有效（清單型資料，非當日交易資料）。
     """
     headers = {"User-Agent": "Mozilla/5.0"}
     seen    = set()
     result  = []
 
-    apis = [
-        # 上市：每月交易統計（有 Code/Name，全年都有資料）
-        ("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL",     "Code", "Name"),
-        # 上市：月平均（備援）
-        ("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_AVG_ALL", "Code", "Name"),
-        # 上櫃：TPEx OpenAPI
-        ("https://openapi.twse.com.tw/v1/exchangeReport/MI_INDEX",          "Code", "Name"),
+    # ── 上市（TWSE）：多個 API 嘗試 ────────────────────────
+    twse_apis = [
+        ("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL",      "Code", "Name"),
+        ("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_AVG_ALL",  "Code", "Name"),
+        ("https://openapi.twse.com.tw/v1/listed/STOCK_DAY_ALL",              "Code", "Name"),
     ]
-
-    for url, code_key, name_key in apis:
+    for url, ck, nk in twse_apis:
+        if len(result) >= 900:   # 上市約 900 支，夠了就停
+            break
         try:
             r    = requests.get(url, headers=headers, timeout=15)
             data = r.json()
-            if not isinstance(data, list) or len(data) == 0:
+            if not isinstance(data, list) or len(data) < 10:
                 continue
             for item in data:
-                code = str(item.get(code_key, "")).strip()
-                name = str(item.get(name_key, "")).strip()
+                code = str(item.get(ck, "")).strip()
+                name = str(item.get(nk, "")).strip()
                 if _re.match(r'^\d{4}$', code) and name and code not in seen:
                     seen.add(code)
                     result.append((code, name))
         except Exception:
             continue
 
-    # 上櫃 TPEx
+    # ── 上櫃（TPEx）：官方 OpenAPI ─────────────────────────
     tpex_apis = [
-        "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes",
-        "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_peratio_analysis",
+        # 每日收盤行情（有 SecuritiesCompanyCode + CompanyName）
+        ("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes",
+         "SecuritiesCompanyCode", "CompanyName"),
+        # 本益比分析（備援）
+        ("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_peratio_analysis",
+         "SecuritiesCompanyCode", "CompanyName"),
+        # 上櫃股票基本資料
+        ("https://www.tpex.org.tw/openapi/v1/tpex_listed_companies",
+         "SecuritiesCompanyCode", "CompanyName"),
     ]
-    for url in tpex_apis:
+    for url, ck, nk in tpex_apis:
+        added = 0
         try:
             r    = requests.get(url, headers=headers, timeout=15)
             data = r.json()
-            if not isinstance(data, list) or len(data) == 0:
+            if not isinstance(data, list) or len(data) < 10:
                 continue
             for item in data:
-                code = str(item.get("SecuritiesCompanyCode", item.get("Code", ""))).strip()
-                name = str(item.get("CompanyName", item.get("Name", ""))).strip()
+                code = str(item.get(ck, "")).strip()
+                name = str(item.get(nk, "")).strip()
                 if _re.match(r'^\d{4}$', code) and name and code not in seen:
                     seen.add(code)
                     result.append((code, name))
-            if result:
+                    added += 1
+            if added > 100:   # 成功抓到上櫃清單就停
                 break
         except Exception:
             continue
@@ -877,18 +887,45 @@ def fetch_twse_top_volume(top_n: int = 800) -> list[tuple[str, str]]:
     return result[:top_n]
 
 
-def run_market_scan_live(progress_bar, status_text, top_n: int = 800):
+def fetch_realtime_price_batch(codes: list[str]) -> dict[str, float]:
     """
-    掃描全市場股票，逐支用 yf.Ticker().history() 下載分析。
+    用 TWSE 即時 API 一次查多支股票的即時價格。
+    回傳 {code: price}。
+    """
+    prices  = {}
+    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://mis.twse.com.tw/"}
+    # 分批查（每批最多 50 支）
+    for i in range(0, len(codes), 50):
+        batch = codes[i:i+50]
+        ex_ch = "|".join([f"tse_{c}.tw" for c in batch] + [f"otc_{c}.tw" for c in batch])
+        try:
+            url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch={ex_ch}&json=1"
+            arr = requests.get(url, headers=headers, timeout=8).json().get("msgArray", [])
+            for item in arr:
+                code = item.get("c", "")
+                z    = item.get("z", "-")
+                if z not in ["-", "", None, "0"]:
+                    try:
+                        prices[code] = float(z)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+    return prices
+
+
+def run_market_scan_live(progress_bar, status_text, result_container, top_n: int = 1800):
+    """
+    掃描全市場股票，逐支分析，找到符合條件就即時顯示。
+    result_container：st.empty() 或 st.container()，用來即時更新結果。
     """
     candidates = fetch_twse_top_volume(top_n)
     n_cand     = len(candidates)
 
     if n_cand == 0:
-        # 所有 API 都失敗 → 用內建清單
         status_text.markdown(
             '<div class="scan-progress-text" style="color:#ef4444;">'
-            '⚠️ 所有股票清單 API 均失敗，使用內建備援清單（16 筆）</div>',
+            '⚠️ 所有股票清單 API 均失敗，使用內建備援清單</div>',
             unsafe_allow_html=True,
         )
         candidates = [
@@ -900,16 +937,115 @@ def run_market_scan_live(progress_bar, status_text, top_n: int = 800):
     elif n_cand < 100:
         status_text.markdown(
             f'<div class="scan-progress-text" style="color:#f59e0b;">'
-            f'⚠️ 只抓到 {n_cand} 筆（API 可能在非交易時間回傳空資料），建議稍後再試</div>',
+            f'⚠️ 只抓到 {n_cand} 筆（可能在非交易時間），建議盤中再試</div>',
             unsafe_allow_html=True,
         )
         time.sleep(1)
     else:
         status_text.markdown(
-            f'<div class="scan-progress-text">📋 成功抓到 {n_cand} 筆股票，開始逐一分析…</div>',
+            f'<div class="scan-progress-text">📋 成功抓到 {n_cand} 筆股票，開始分析…</div>',
             unsafe_allow_html=True,
         )
         time.sleep(0.3)
+
+    total        = len(candidates)
+    results      = []
+    skip         = 0
+    PREVIEW_STEP = 5   # 每找到 5 筆就刷新一次即時顯示
+
+    for i, (code, name) in enumerate(candidates):
+        pct = (i + 1) / total
+        progress_bar.progress(pct)
+        status_text.markdown(
+            f'<div class="scan-progress-text">'
+            f'分析 {i+1}/{total}　{name}（{code}）　'
+            f'<span style="color:#4ade80;">✅ {len(results)} 筆</span>　'
+            f'⬜ {skip} 略過</div>',
+            unsafe_allow_html=True,
+        )
+
+        df = None
+        for suffix in [".TW", ".TWO"]:
+            try:
+                tmp = yf.Ticker(f"{code}{suffix}").history(period="2mo")
+                if tmp is not None and not tmp.empty and len(tmp) >= 22:
+                    df = tmp
+                    break
+            except Exception:
+                pass
+
+        if df is None:
+            skip += 1
+            continue
+
+        try:
+            score, info = score_stock(df, code)
+            if score is None or score < 30:
+                skip += 1
+                continue
+            results.append({"code": code, "name": name, "score": score, **info})
+
+            # 每找到 PREVIEW_STEP 筆就即時更新預覽
+            if len(results) % PREVIEW_STEP == 0:
+                _render_live_preview(result_container, results)
+        except Exception:
+            skip += 1
+            continue
+
+    progress_bar.progress(1.0)
+    status_text.markdown(
+        f'<div class="scan-progress-text" style="color:#4ade80;">'
+        f'✅ 掃描完成！共分析 {total} 支，找到 {len(results)} 筆強勢股</div>',
+        unsafe_allow_html=True,
+    )
+
+    # 補抓即時股價
+    if results:
+        status_text.markdown(
+            '<div class="scan-progress-text">📡 補抓即時股價…</div>',
+            unsafe_allow_html=True,
+        )
+        codes       = [s["code"] for s in results]
+        rt_prices   = fetch_realtime_price_batch(codes)
+        for s in results:
+            if s["code"] in rt_prices:
+                s["realtime_price"] = rt_prices[s["code"]]
+
+    results.sort(key=lambda x: x["score"], reverse=True)
+    return results
+
+
+def _render_live_preview(container, results):
+    """即時預覽：顯示目前已找到的前 10 筆（掃描中用）"""
+    top = sorted(results, key=lambda x: x["score"], reverse=True)[:10]
+    SCORE_COLORS = ["#f59e0b","#94a3b8","#cd7f32","#38bdf8","#38bdf8",
+                    "#38bdf8","#38bdf8","#38bdf8","#38bdf8","#38bdf8"]
+    html = '<div style="margin-top:0.5rem;">'
+    html += '<div style="font-size:0.65rem;color:#475569;margin-bottom:0.4rem;">🔴 即時預覽（掃描中持續更新）</div>'
+    for i, s in enumerate(top):
+        pct      = (s["close"] - s["prev"]) / s["prev"] * 100 if s.get("prev") else 0
+        pc       = "#ef4444" if pct > 0 else "#22c55e"
+        sc_color = SCORE_COLORS[i] if i < len(SCORE_COLORS) else "#38bdf8"
+        rt       = s.get("realtime_price")
+        price_str = f'{rt:.2f}' if rt else f'{s["close"]:.2f}'
+        price_label = "即時" if rt else "收盤"
+        reasons  = "　".join(s.get("reasons", []))
+        medal    = MEDALS[i] if i < len(MEDALS) else f"#{i+1}"
+        html += (
+            f'<div class="scan-row" style="--sr:{sc_color};">'
+            f'<div class="scan-row-rank">{medal}</div>'
+            f'<div class="scan-row-info">'
+            f'<div class="scan-row-name">{s["name"]}</div>'
+            f'<div class="scan-row-code">{s["code"]} · {reasons}</div>'
+            f'</div>'
+            f'<div class="scan-row-right">'
+            f'<div class="scan-row-score" style="color:{sc_color};">{s["score"]}分</div>'
+            f'<div style="font-size:0.7rem;font-weight:700;color:#f1f5f9;">{price_str}</div>'
+            f'<div class="scan-row-pct" style="color:{pc};">▲ {abs(pct):.1f}%　{price_label}</div>'
+            f'</div></div>'
+        )
+    html += '</div>'
+    container.markdown(html, unsafe_allow_html=True)
 
     total   = len(candidates)
     results = []
@@ -1206,22 +1342,24 @@ def _score_bar_color(score):
 def render_scan_row(rank, s, in_watchlist):
     pct       = (s["close"] - s["prev"]) / s["prev"] * 100 if s.get("prev") else 0
     pct_color = "#ef4444" if pct > 0 else "#22c55e"
-    pct_str   = f"{'▲' if pct>0 else '▼'} {abs(pct):.2f}%"
+    pct_arr   = "▲" if pct > 0 else "▼"
     sc        = s["score"]
     sc_color  = _score_color(sc)
     bar_color = _score_bar_color(sc)
-    sr_color  = sc_color
+
+    # 即時股價優先，否則用收盤
+    rt          = s.get("realtime_price")
+    price_str   = f'{rt:.2f}' if rt else f'{s["close"]:.2f}'
+    price_label = '<span style="color:#38bdf8;font-size:0.55rem;">即時</span>' if rt else \
+                  '<span style="color:#475569;font-size:0.55rem;">收盤</span>'
 
     reasons = s.get("reasons", [])
-    if reasons:
-        chips = "".join(f'<span class="scan-sig-chip">{r}</span>' for r in reasons)
-    else:
-        chips = '<span class="scan-sig-chip neutral">無明顯信號</span>'
-
-    medal = MEDALS[rank - 1] if rank <= 5 else f"#{rank}"
+    chips   = "".join(f'<span class="scan-sig-chip">{r}</span>' for r in reasons) \
+              if reasons else '<span class="scan-sig-chip neutral">無明顯信號</span>'
+    medal   = MEDALS[rank - 1] if rank <= 5 else f"#{rank}"
 
     st.markdown(
-        f'<div class="scan-row" style="--sr:{sr_color};">'
+        f'<div class="scan-row" style="--sr:{sc_color};">'
         f'<div class="scan-row-rank">{medal}</div>'
         f'<div class="scan-row-info">'
         f'<div class="scan-row-name">{s["name"]}</div>'
@@ -1231,23 +1369,23 @@ def render_scan_row(rank, s, in_watchlist):
         f'</div>'
         f'<div class="scan-row-right">'
         f'<div class="scan-row-score" style="color:{sc_color};">{sc}分</div>'
-        f'<div class="score-bar-wrap" style="width:56px;margin:3px 0 3px auto;">'
+        f'<div class="score-bar-wrap" style="width:56px;margin:3px 0 2px auto;">'
         f'<div class="score-bar-fill" style="--sw:{min(sc,100)}%;background:{bar_color};"></div></div>'
-        f'<div class="scan-row-pct" style="color:{pct_color};">{pct_str}</div>'
+        f'<div style="font-family:\'JetBrains Mono\',monospace;font-size:0.85rem;'
+        f'font-weight:700;color:#f1f5f9;text-align:right;">{price_str} {price_label}</div>'
+        f'<div class="scan-row-pct" style="color:{pct_color};">{pct_arr} {abs(pct):.2f}%</div>'
         f'</div></div>',
         unsafe_allow_html=True,
     )
-    # 加入關注清單按鈕
-    btn_label = f"✓ 已加入" if in_watchlist else f"＋ 加入關注"
     if not in_watchlist:
-        if st.button(btn_label, key=f"qadd_{s['code']}_{rank}", use_container_width=True):
+        if st.button("＋ 加入關注", key=f"qadd_{s['code']}_{rank}", use_container_width=True):
             st.session_state.watchlist.append({"id": s["code"], "name": s["name"]})
             save_watchlist(st.session_state.watchlist)
             st.rerun()
     else:
         st.markdown(
-            f'<div style="font-size:0.65rem;color:#4ade80;text-align:center;'
-            f'padding:0.2rem 0;margin-bottom:0.35rem;">✓ 已在關注清單</div>',
+            '<div style="font-size:0.65rem;color:#4ade80;text-align:center;'
+            'padding:0.2rem 0;margin-bottom:0.35rem;">✓ 已在關注清單</div>',
             unsafe_allow_html=True,
         )
 
@@ -1285,12 +1423,16 @@ def render_scan_section():
     if do_scan or st.session_state.scan_results is None:
         st.markdown(
             '<div style="font-size:0.7rem;color:#64748b;margin-bottom:0.4rem;">'
-            '正在抓取全市場上市股清單，以批次方式進行技術分析…</div>',
+            '正在抓取全市場上市＋上櫃股票清單，逐一技術分析，找到符合條件即時顯示…</div>',
             unsafe_allow_html=True,
         )
-        progress_bar = st.progress(0)
-        status_text  = st.empty()
-        all_results  = run_market_scan_live(progress_bar, status_text, top_n=800)
+        progress_bar     = st.progress(0)
+        status_text      = st.empty()
+        result_container = st.empty()   # 即時預覽區
+        all_results      = run_market_scan_live(
+            progress_bar, status_text, result_container, top_n=1800
+        )
+        result_container.empty()   # 掃描完後清掉預覽，改用正式分頁顯示
         st.session_state.scan_results   = all_results
         st.session_state.scan_timestamp = datetime.now().strftime("%m/%d %H:%M")
         st.session_state.scan_page      = 0
