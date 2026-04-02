@@ -784,35 +784,50 @@ def score_stock(df, code):
 
     score   = 0
     reasons = []
+    breakdown = {}  # 各指標得分明細
     change  = (last_close - prev_close) / prev_close if prev_close else 0
 
-    # ① MA 趨勢：MA5 > MA20
+    # ① MA 趨勢：MA5 > MA20  → 最高 30 分
     if last_ma5 > 0 and last_ma20 > 0 and last_ma5 > last_ma20:
         score += 30
         reasons.append("均線多頭")
+        breakdown["均線多頭 MA5>MA20"] = 30
+    else:
+        breakdown["均線多頭 MA5>MA20"] = 0
 
-    # ② 接近 60 日新高（>= 97%）
+    # ② 接近 60 日新高（>= 97%）→ 最高 30 分
     if high60 > 0 and last_close >= high60 * 0.97:
         score += 30
         reasons.append("逼近新高")
+        breakdown["逼近60日新高 ≥97%"] = 30
+    else:
+        breakdown["逼近60日新高 ≥97%"] = 0
 
-    # ③ 量能爆發：當日量 > 5日均量 × 1.5
+    # ③ 量能爆發：當日量 > 5日均量 × 1.5  → 最高 20 分
     if last_volma5 > 0 and last_vol > last_volma5 * 1.5:
         score += 20
         reasons.append("量能爆發")
+        breakdown["量能爆發 >均量×1.5"] = 20
+    else:
+        breakdown["量能爆發 >均量×1.5"] = 0
 
-    # ④ 當日漲幅
+    # ④ 當日漲幅  → 最高 20 分
     if change > 0.03:
         score += 20
         reasons.append(f"強漲{change*100:.1f}%")
+        breakdown[f"強漲 >3% ({change*100:.1f}%)"] = 20
     elif change > 0.01:
         score += 8
         reasons.append(f"小漲{change*100:.1f}%")
+        breakdown[f"小漲 1~3% ({change*100:.1f}%)"] = 8
+    else:
+        breakdown["當日漲幅"] = 0
 
     return score, {
         "K": last_k, "D": last_d, "RSI": last_rsi,
         "MACD_hist": change,
         "reasons": reasons,
+        "breakdown": breakdown,
         "close": last_close,
         "prev":  prev_close,
     }
@@ -985,105 +1000,70 @@ def fetch_realtime_price_batch(codes: list[str]) -> dict[str, float]:
     return prices
 
 
+@st.cache_data(ttl=1800)
+def _fetch_hist_cached(code: str) -> pd.DataFrame | None:
+    """
+    快取單支股票 2 個月歷史（ttl=30 分鐘）。
+    第二次掃描直接從 Streamlit 快取讀，不重打 Yahoo Finance API。
+    """
+    for suffix in [".TW", ".TWO"]:
+        try:
+            df = yf.Ticker(f"{code}{suffix}").history(period="2mo")
+            if df is not None and not df.empty and len(df) >= 22:
+                return df
+        except Exception:
+            pass
+    return None
+
+
 def run_market_scan_live(progress_bar, status_text, result_container, top_n: int = 1800):
     """
     掃描全市場股票。
-    用 yf.download() 批次下載（每批 100 支），速度約快 10 倍。
-    找到符合條件就即時更新預覽。
+    使用 @st.cache_data 逐支快取，第二次掃描從快取讀，結果穩定不會變 0。
     """
     candidates = fetch_twse_top_volume(top_n)
     n_cand     = len(candidates)
 
     status_text.markdown(
-        f'<div class="scan-progress-text">📋 股票清單 {n_cand} 筆，批次下載中…</div>',
+        f'<div class="scan-progress-text">📋 股票清單 {n_cand} 筆，開始掃描…</div>',
         unsafe_allow_html=True,
     )
 
     total        = len(candidates)
     results      = []
-    BATCH        = 100
     PREVIEW_STEP = 5
 
-    for batch_start in range(0, total, BATCH):
-        batch     = candidates[batch_start: batch_start + BATCH]
-        batch_end = min(batch_start + BATCH, total)
+    for i, (code, name) in enumerate(candidates):
+        progress_bar.progress((i + 1) / total)
+        if i % 10 == 0:
+            status_text.markdown(
+                f'<div class="scan-progress-text">'
+                f'分析 {i+1}/{total}　{name}（{code}）　'
+                f'<span style="color:#4ade80;">✅ {len(results)} 筆</span></div>',
+                unsafe_allow_html=True,
+            )
 
-        # 進度
-        pct = batch_start / total
-        progress_bar.progress(pct)
-        status_text.markdown(
-            f'<div class="scan-progress-text">'
-            f'下載 {batch_start+1}–{batch_end}/{total}　'
-            f'<span style="color:#4ade80;">✅ {len(results)} 筆</span></div>',
-            unsafe_allow_html=True,
-        )
-
-        # 同時嘗試 .TW 和 .TWO（合併成一次 download）
-        tickers_tw  = [f"{c}.TW"  for c, _ in batch]
-        tickers_two = [f"{c}.TWO" for c, _ in batch]
-        all_tickers = tickers_tw + tickers_two
+        df = _fetch_hist_cached(code)
+        if df is None:
+            continue
 
         try:
-            raw = yf.download(
-                all_tickers,
-                period="2mo",
-                progress=False,
-                auto_adjust=True,
-            )
+            score, info = score_stock(df, code)
+            if score is None or score < 30:
+                continue
+            results.append({"code": code, "name": name, "score": score, **info})
+            if len(results) % PREVIEW_STEP == 0:
+                _render_live_preview(result_container, results)
         except Exception:
-            # 這批下載失敗，跳過
             continue
-
-        if raw is None or raw.empty:
-            continue
-
-        # 解析 MultiIndex：新版 yfinance level0=Price欄位, level1=Ticker
-        has_multi = isinstance(raw.columns, pd.MultiIndex)
-
-        for code, name in batch:
-            df = None
-            for suffix in [".TW", ".TWO"]:
-                ticker_key = f"{code}{suffix}"
-                try:
-                    if has_multi:
-                        lvl1 = raw.columns.get_level_values(1)
-                        if ticker_key in lvl1:
-                            df_try = raw.xs(ticker_key, axis=1, level=1)
-                            if not df_try.empty and len(df_try.dropna(how="all")) >= 22:
-                                df = df_try
-                                break
-                    else:
-                        # 只有一支時是普通 DataFrame
-                        if not raw.empty and len(raw.dropna(how="all")) >= 22:
-                            df = raw
-                            break
-                except Exception:
-                    continue
-
-            if df is None:
-                continue
-
-            try:
-                score, info = score_stock(df, code)
-                if score is None or score < 30:
-                    continue
-                results.append({"code": code, "name": name, "score": score, **info})
-                if len(results) % PREVIEW_STEP == 0:
-                    _render_live_preview(result_container, results)
-            except Exception:
-                continue
-
-        # 每批結束更新一次進度
-        progress_bar.progress(batch_end / total)
 
     progress_bar.progress(1.0)
     status_text.markdown(
         f'<div class="scan-progress-text" style="color:#4ade80;">'
-        f'✅ 掃描完成！分析 {total} 支，找到 {len(results)} 筆強勢股，補抓即時股價中…</div>',
+        f'✅ 掃描完成！分析 {total} 支，找到 {len(results)} 筆，補抓即時股價中…</div>',
         unsafe_allow_html=True,
     )
 
-    # 補抓即時股價
     if results:
         codes     = [s["code"] for s in results]
         rt_prices = fetch_realtime_price_batch(codes)
@@ -1427,7 +1407,6 @@ def render_scan_row(rank, s, in_watchlist):
     sc_color  = _score_color(sc)
     bar_color = _score_bar_color(sc)
 
-    # 即時股價優先，否則用收盤
     rt          = s.get("realtime_price")
     price_str   = f'{rt:.2f}' if rt else f'{s["close"]:.2f}'
     price_label = '<span style="color:#38bdf8;font-size:0.55rem;">即時</span>' if rt else \
@@ -1438,6 +1417,33 @@ def render_scan_row(rank, s, in_watchlist):
               if reasons else '<span class="scan-sig-chip neutral">無明顯信號</span>'
     medal   = MEDALS[rank - 1] if rank <= 5 else f"#{rank}"
 
+    # 評分明細
+    breakdown = s.get("breakdown", {})
+    bd_html = ""
+    if breakdown:
+        bd_items = "".join(
+            f'<div style="display:flex;justify-content:space-between;padding:0.15rem 0;'
+            f'border-bottom:1px solid rgba(255,255,255,0.04);">'
+            f'<span style="color:#94a3b8;font-size:0.62rem;">{label}</span>'
+            f'<span style="font-family:\'JetBrains Mono\',monospace;font-size:0.62rem;'
+            f'color:{"#4ade80" if pts > 0 else "#475569"};font-weight:700;">'
+            f'{"+" if pts > 0 else ""}{pts}分</span>'
+            f'</div>'
+            for label, pts in breakdown.items()
+        )
+        bd_html = (
+            f'<div style="background:rgba(0,0,0,0.2);border-radius:8px;'
+            f'padding:0.4rem 0.6rem;margin-top:0.4rem;">'
+            f'<div style="font-size:0.6rem;color:#475569;letter-spacing:0.08em;'
+            f'text-transform:uppercase;margin-bottom:0.3rem;">評分明細（滿分100）</div>'
+            f'{bd_items}'
+            f'<div style="display:flex;justify-content:space-between;padding-top:0.3rem;">'
+            f'<span style="font-size:0.65rem;font-weight:700;color:#e2e8f0;">總分</span>'
+            f'<span style="font-family:\'JetBrains Mono\',monospace;font-size:0.65rem;'
+            f'font-weight:700;color:{sc_color};">{sc} 分</span>'
+            f'</div></div>'
+        )
+
     st.markdown(
         f'<div class="scan-row" style="--sr:{sc_color};">'
         f'<div class="scan-row-rank">{medal}</div>'
@@ -1446,6 +1452,7 @@ def render_scan_row(rank, s, in_watchlist):
         f'<div class="scan-row-code">{s["code"]} · '
         f'K{s["K"]:.0f} D{s["D"]:.0f} RSI{s["RSI"]:.0f}</div>'
         f'<div class="scan-row-signals">{chips}</div>'
+        f'{bd_html}'
         f'</div>'
         f'<div class="scan-row-right">'
         f'<div class="scan-row-score" style="color:{sc_color};">{sc}分</div>'
@@ -1488,17 +1495,25 @@ def render_scan_section():
             st.session_state[k] = v
 
     # ── 掃描按鈕 ────────────────────────────────────────────
-    col1, col2 = st.columns([3, 1])
+    col1, col2, col3 = st.columns([3, 1, 1])
     with col1:
         if st.session_state.scan_timestamp:
             total_cnt = len(st.session_state.scan_results or [])
+            cached_cnt = len(st.session_state.get("scan_df_cache", {}))
             st.markdown(
                 f'<div style="font-size:0.65rem;color:#475569;">'
-                f'上次掃描：{st.session_state.scan_timestamp}　共 {total_cnt} 筆</div>',
+                f'上次掃描：{st.session_state.scan_timestamp}　共 {total_cnt} 筆'
+                f'　<span style="color:#334155;">快取 {cached_cnt} 支</span></div>',
                 unsafe_allow_html=True,
             )
     with col2:
         do_scan = st.button("▶ 掃描", key="scan_btn", use_container_width=True)
+    with col3:
+        if st.button("🗑️ 清快取", key="scan_clear_btn", use_container_width=True):
+            st.session_state.scan_df_cache  = {}
+            st.session_state.scan_results   = None
+            st.session_state.scan_timestamp = None
+            st.rerun()
 
     if do_scan or st.session_state.scan_results is None:
         st.markdown(
